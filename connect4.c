@@ -529,12 +529,12 @@ State* newGame() {
     return state;
 }
 
+i8 searchOrder[] = { 3, 2, 4, 1, 5, 0, 6 };
+
 Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     if (depth <= 0) {
         return heuristicScore(node, player);
     }
-
-    // TODO Check transposition table cache here?
 
     i32 playable_ys = node->playable_ys;
 
@@ -557,8 +557,10 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     i8 valid_cols = 0;
 
     // Absent a force move, search for instant wins
-    for (i8 x=0; x<NUM_COLS; x++) {
+    for (i8 i=0; i<NUM_COLS; i++) {
+        i8 x = searchOrder[i];
         i8 y = getPlayableY(playable_ys, x);
+
         if (y < NUM_ROWS) {
             State* child = children[depth-1][x];
 
@@ -572,7 +574,9 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     }
 
     // Absent forced move or instant win, search recursively
-    for (i8 x=0; x<NUM_COLS; x++) {
+    for (i8 i=0; i<NUM_COLS; i++) {
+        i8 x = searchOrder[i];
+
         if (valid_cols & (1 << x)) {
             State* child = children[depth-1][x];
 
@@ -625,11 +629,10 @@ Score score(int numMoves, i8* moves, int depth) {
         player = -player;
     }
 
-    // Player is now the opponent of the player who just moved
     if (outcome == OUTCOME_WIN)
-        return -(player*INF);
+        return INF;
     if (outcome == OUTCOME_LOSS)
-        return player*INF;
+        return -INF;
 
     initStorage(depth);
 
