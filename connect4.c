@@ -16,7 +16,8 @@
 #define NUM_COLS 7
 
 #define Score float
-#define INF 1
+#define SCORE_MAX 1
+#define SCORE_INVALID -2 // ensure lower score than a loss
 
 // can't use enum because need negatives
 #define Owner signed char
@@ -47,8 +48,6 @@ typedef struct state {
     i64 p2_owned_bitfield;
     i8 p1_threats;
     i8 p2_threats;
-    i8 p1_forces_on_opponent;
-    i8 p2_forces_on_opponent;
     i32 playable_ys;
     i8 forced_next_move;
 } State;
@@ -107,13 +106,154 @@ void printDebuggingInfo(Player player, i8 x, i8 y, State* parent, State* child, 
 
     i8 p2_moves = bitsSet(child->p2_owned_bitfield);
 
-    printBoard(parent);
+//    printBoard(parent);
     printBoard(child);
 
     fprintf(stderr,"playable Ys: %d %d %d %d %d %d %d\t", tops[0], tops[1], tops[2], tops[3], tops[4], tops[5], tops[6]);
     fprintf(stderr,"player: %d\tx: %d\ty: %d\tp1 moves: %d\tp2 moves: %d\n", player, x, y, bitsSet(child->p1_owned_bitfield), p2_moves);
-    fprintf(stderr,"p1 forces=%d, threats=%d; p2 forces=%d, threats=%d; score=%f\n", child->p1_forces_on_opponent, child->p1_threats, child->p2_forces_on_opponent, child->p2_threats, res);
+    fprintf(stderr,"p1 threats=%d; p2 threats=%d; forced_next_move=%d; score=%f\n", child->p1_threats, child->p2_threats, child->forced_next_move, res);
     fprintf(stderr,"\n\n");
+}
+
+#define CacheIdx unsigned int
+#define CACHE_CAPACITY 524288 // 2^19 - needs to be power of two
+#define MAX_CACHE_LOAD 367001 // ~0.7*CACHE_CAPACITY
+#define TARGET_CACHE_LOAD 262144 // ~0.5*CACHE_CAPACITY
+#define MIN_DEPTH_TO_CACHE 3
+
+typedef enum cacheflags {
+    EXACT = 1,
+    AT_MOST = 2,
+    AT_LEAST = 4
+} CacheFlags;
+
+typedef struct cacheval {
+    i64 p1_bits;
+    i64 p2_bits;
+    Score score;
+    struct cacheval* nextUsed;
+    struct cacheval* prevUsed;
+    CacheFlags flags;
+} CacheVal;
+
+CacheIdx cacheSize;
+CacheVal** cache;
+CacheVal* mostRecentlyUsed;
+
+i32 hash(i64 key) {
+    // See http://www.concentric.net/~ttwang/tech/inthash.htm
+    key = (~key) + (key << 18);
+    key = key ^ (key >> 31);
+    key = key * 21;
+    key = key ^ (key >> 11);
+    key = key + (key << 6);
+    key = key ^ (key >> 22);
+    return key;
+}
+
+bool isCacheValSet(CacheVal* val) {
+    return val->flags > 0;
+}
+
+bool cacheValMatches(CacheVal* val, i64 p1_bits, i64 p2_bits) {
+    return (val->p1_bits == p1_bits) && (val->p2_bits == p2_bits);
+}
+
+// We hash based only on which cells are owned, not who owns them
+CacheIdx initialAddress(i64 p1_bits, i64 p2_bits) {
+    return hash(p1_bits ^ p2_bits) & (CACHE_CAPACITY - 1);
+}
+
+void setCacheValBlank(CacheVal* val) {
+    val->score = SCORE_INVALID;
+    val->prevUsed = NULL;
+    val->nextUsed = NULL;
+    val->p1_bits = 0;
+    val->p2_bits = 0;
+    val->flags = 0;
+}
+
+void recordCacheValUse(CacheVal* val) {
+    CacheVal* oldPrev = val->prevUsed;
+    CacheVal* oldNext = val->nextUsed;
+
+    // Add val to front of list
+    val->nextUsed = NULL;
+    val->prevUsed = mostRecentlyUsed;
+    if (mostRecentlyUsed != NULL)
+        mostRecentlyUsed->nextUsed = val;
+    mostRecentlyUsed = val;
+
+    // Patch list where val used to be, if necessary
+    if (oldNext != NULL)
+        oldNext->prevUsed = oldPrev;
+    if (oldPrev != NULL)
+        oldPrev->nextUsed = oldNext;
+}
+
+void cleanCache() {
+    assert(cacheSize >= MAX_CACHE_LOAD);
+
+    CacheVal* val = mostRecentlyUsed;
+    for (CacheIdx i=0; i<TARGET_CACHE_LOAD; i++) {
+        assert(val != NULL);
+        val = val->prevUsed;
+    }
+
+    assert(val->nextUsed != NULL);
+    (val->nextUsed)->prevUsed = NULL;
+
+    do {
+        assert(val != NULL);
+        CacheVal* tmp = val->prevUsed;
+        setCacheValBlank(val);
+        val = tmp;
+    } while (val != NULL);
+
+    cacheSize = TARGET_CACHE_LOAD;
+}
+
+CacheVal* getCacheValue(i64 p1_bits, i64 p2_bits) {
+    CacheIdx addr = initialAddress(p1_bits, p2_bits);
+    CacheVal* val = cache[addr];
+    while (isCacheValSet(val) && !cacheValMatches(val, p1_bits, p2_bits)) {
+        addr = (addr+1) & (CACHE_CAPACITY - 1);
+        val = cache[addr];
+    }
+    return val;
+}
+
+void setCacheValue(i64 p1_bits, i64 p2_bits, Score score, CacheFlags flags) {
+    CacheVal* val = getCacheValue(p1_bits, p2_bits);
+
+    assert(isCacheValSet(val) == cacheValMatches(val, p1_bits, p2_bits));
+
+    val->p1_bits = p1_bits;
+    val->p2_bits = p2_bits;
+    val->score = score;
+    val->flags = flags;
+
+    recordCacheValUse(val);
+
+    cacheSize++;
+
+    assert(val->score == getCacheValue(p1_bits, p2_bits)->score);
+
+    if (cacheSize > MAX_CACHE_LOAD)
+        cleanCache();
+
+    assert(val->score == getCacheValue(p1_bits, p2_bits)->score);
+}
+
+CacheVal* checkCache(i64 p1_bits, i64 p2_bits) {
+    CacheVal* val = getCacheValue(p1_bits, p2_bits);
+
+    assert(isCacheValSet(val) == cacheValMatches(val, p1_bits, p2_bits));
+
+    if (isCacheValSet(val))
+        recordCacheValUse(val);
+
+    return val;
 }
 
 Owner owner(i64 p_owned_bitfield, i64 o_owned_bitfield, i32 playable_ys, i8 x, i8 y) {
@@ -288,8 +428,7 @@ void countThreats(
     }
 }
 
-// Returns bitfield containing columns with forced moves by opponent next turn, or -1 for a win
-i8 countThreatsAtCellJustTaken(
+Outcome countThreatsAtCellJustTaken(
     i64 player_owned_bitfield,
     i64 opponent_owned_bitfield,
     i32 playable_ys,
@@ -297,13 +436,12 @@ i8 countThreatsAtCellJustTaken(
     i8 y,
     i8* player_threats,
     i8* opponent_threats,
-    i8* player_forces_on_opponent,
-    i8* opponent_forces_on_player
+    i8* forced_moves_next_turn_bitfield,
+    bool opponent_has_win
 ) {
     i8 player_connect3s = 0;
     i8 opponent_connect3s = 0;
     i8 player_2_none_1s = 0;
-    i8 force_cols_bitfield = 0;
 
     countThreats(
         player_owned_bitfield,
@@ -314,33 +452,22 @@ i8 countThreatsAtCellJustTaken(
         &player_connect3s,
         &player_2_none_1s,
         &opponent_connect3s,
-        &force_cols_bitfield
+        forced_moves_next_turn_bitfield
     );
 
-    // close threats & forces corresponding to connect-3s which terminate at cell just taken
-    if (player_connect3s > 0) {
-        (*player_forces_on_opponent)--;
-        (*player_threats) -= player_connect3s;
-    }
-    if (opponent_connect3s > 0) {
-        (*opponent_forces_on_player)--;
-        (*opponent_threats) -= opponent_connect3s;
-    }
-
-    // open threats & forces corresponding to new 3-out-of-4s now owned by player which include cell just taken
-    (*player_threats) += player_2_none_1s;
-    if (force_cols_bitfield)
-        (*player_forces_on_opponent)++;
-    if (force_cols_bitfield & (force_cols_bitfield-1)) // at least two bits set - we only care about two, because two forces is enough for a win
-        (*player_forces_on_opponent)++;
-
     if (player_connect3s > 0)
-        return -1; // we just got connect-4
-    else
-        return force_cols_bitfield;
+        return OUTCOME_WIN; // We just got connect-4
+
+    if (opponent_has_win && opponent_connect3s == 0)
+        return OUTCOME_LOSS; // We failed to block their connect-4 next turn
+
+    (*opponent_threats) -= opponent_connect3s;
+    (*player_threats) += player_2_none_1s;
+
+    return OUTCOME_UNKNOWN;
 }
 
-void countThreatsAtCellJustMadePlayable(
+Outcome countThreatsAtCellJustMadePlayable(
     i64 player_owned_bitfield,
     i64 opponent_owned_bitfield,
     i32 playable_ys,
@@ -348,8 +475,7 @@ void countThreatsAtCellJustMadePlayable(
     i8 y,
     i8* player_threats,
     i8* opponent_threats,
-    i8* player_forces_on_opponent,
-    i8* opponent_forces_on_player
+    i8* forced_moves_next_turn_bitfield
 ) {
     i8 player_connect3s = 0;
     i8 opponent_connect3s = 0;
@@ -367,19 +493,20 @@ void countThreatsAtCellJustMadePlayable(
         &dont_care
     );
 
-    // open threats & forces corresponding to existing connect-3s which now have their open cell playable
-    if (player_connect3s > 0) {
-        (*player_forces_on_opponent)++;
-        (*player_threats) += player_connect3s;
-    }
-    if (opponent_connect3s > 0) {
-        (*opponent_forces_on_player)++;
-        (*opponent_threats) += opponent_connect3s;
-    }
+    if (opponent_connect3s > 0)
+        return OUTCOME_LOSS; // We just gave them connect-4 next turn
+
+    if (player_connect3s > 0)
+        (*forced_moves_next_turn_bitfield) |= (1 << x);
+
+    (*player_threats) += player_connect3s;
+
+    return OUTCOME_UNKNOWN;
 }
 
-Outcome outcomeGivenForce(i8 force_cols_bitfield, i8 cur_col) {
+Outcome outcomeAbsentConnect4ThisTurnOrNext(i8 force_cols_bitfield) {
     switch (force_cols_bitfield) {
+        case 0: return OUTCOME_UNKNOWN;
         case 1: return OUTCOME_FORCE_0;
         case 2: return OUTCOME_FORCE_1;
         case 4: return OUTCOME_FORCE_2;
@@ -387,83 +514,62 @@ Outcome outcomeGivenForce(i8 force_cols_bitfield, i8 cur_col) {
         case 16: return OUTCOME_FORCE_4;
         case 32: return OUTCOME_FORCE_5;
         case 64: return OUTCOME_FORCE_6;
-        default: return (Outcome) cur_col; // we didn't find a force including the just-played cell, so it must be open at the cell above
+        default: return OUTCOME_WIN; // There must be at least two forced moves, which our opponent can't satisfy
     }
 }
 
-Outcome countConnect3sOr4sAfterMove(State* state, Player player, i8 x, i8 y) {
-    i64 player_owned_bitfield, opponent_owned_bitfield;
-    i8 player_threats, player_forces_on_opponent, opponent_threats, opponent_forces_on_player;
+Outcome countConnect3sOr4sAfterMove(State* state, Player player, i8 x, i8 y, bool forced_move_this_turn) {
+    i64 player_owned_bitfield;
+    i64 opponent_owned_bitfield;
+    i8* player_threats;
+    i8* opponent_threats;
+    i8 forced_moves_next_turn_bitfield = 0;
 
     if (player == P1) {
         player_owned_bitfield = state->p1_owned_bitfield;
         opponent_owned_bitfield = state->p2_owned_bitfield;
-        player_threats = state->p1_threats;
-        opponent_threats = state->p2_threats;
-        player_forces_on_opponent = state->p1_forces_on_opponent;
-        opponent_forces_on_player = state->p2_forces_on_opponent;
+        player_threats = &(state->p1_threats);
+        opponent_threats = &(state->p2_threats);
     }
     else {
         player_owned_bitfield = state->p2_owned_bitfield;
         opponent_owned_bitfield = state->p1_owned_bitfield;
-        player_threats = state->p2_threats;
-        opponent_threats = state->p1_threats;
-        player_forces_on_opponent = state->p2_forces_on_opponent;
-        opponent_forces_on_player = state->p1_forces_on_opponent;
+        player_threats = &(state->p2_threats);
+        opponent_threats = &(state->p1_threats);
     }
 
-    i8 force_cols_bitfield = countThreatsAtCellJustTaken(
+    Outcome outcome = countThreatsAtCellJustTaken(
         player_owned_bitfield,
         opponent_owned_bitfield,
         state->playable_ys,
         x,
         y,
-        &player_threats,
-        &opponent_threats,
-        &player_forces_on_opponent,
-        &opponent_forces_on_player
+        player_threats,
+        opponent_threats,
+        &forced_moves_next_turn_bitfield,
+        forced_move_this_turn
     );
 
+    if (outcome == OUTCOME_WIN || outcome == OUTCOME_LOSS)
+        return outcome;
+
     if (y < NUM_ROWS-1) {
-        countThreatsAtCellJustMadePlayable(
+        outcome = countThreatsAtCellJustMadePlayable(
             player_owned_bitfield,
             opponent_owned_bitfield,
             state->playable_ys,
             x,
             y+1,
-            &player_threats,
-            &opponent_threats,
-            &player_forces_on_opponent,
-            &opponent_forces_on_player
+            player_threats,
+            opponent_threats,
+            &forced_moves_next_turn_bitfield
         );
+
+        if (outcome == OUTCOME_LOSS)
+            return outcome;
     }
 
-    if (player == P1) {
-        state->p1_threats = player_threats;
-        state->p2_threats = opponent_threats;
-        state->p1_forces_on_opponent = player_forces_on_opponent;
-        state->p2_forces_on_opponent = opponent_forces_on_player;
-    }
-    else {
-        state->p2_threats = player_threats;
-        state->p1_threats = opponent_threats;
-        state->p2_forces_on_opponent = player_forces_on_opponent;
-        state->p1_forces_on_opponent = opponent_forces_on_player;
-    }
-
-    if (force_cols_bitfield == -1)
-        return OUTCOME_WIN; // we just got connect-4
-
-    if (opponent_forces_on_player > 0)
-        return OUTCOME_LOSS; // they have connect-4 next turn
-
-    if (player_forces_on_opponent > 1)
-        return OUTCOME_WIN; // we are guaranteed connect-4 turn after next
-
-    if (player_forces_on_opponent > 0)
-        return outcomeGivenForce(force_cols_bitfield, x);
-
-    return OUTCOME_UNKNOWN;
+    return outcomeAbsentConnect4ThisTurnOrNext(forced_moves_next_turn_bitfield);
 }
 
 Outcome setToStateAfterMove(State* parent, State* child, Player player, i8 x, i8 y) {
@@ -480,12 +586,10 @@ Outcome setToStateAfterMove(State* parent, State* child, Player player, i8 x, i8
 
     child->p1_threats = parent->p1_threats;
     child->p2_threats = parent->p2_threats;
-    child->p1_forces_on_opponent = parent->p1_forces_on_opponent;
-    child->p2_forces_on_opponent = parent->p2_forces_on_opponent;
 
     child->playable_ys = incrementPlayableY(parent->playable_ys, x);
 
-    Outcome outcome = countConnect3sOr4sAfterMove(child, player, x, y);
+    Outcome outcome = countConnect3sOr4sAfterMove(child, player, x, y, parent->forced_next_move > -1);
 
     if (outcome < OUTCOME_WIN) // force move
         child->forced_next_move = outcome;
@@ -510,7 +614,7 @@ Score heuristicScore(State* node, Player player) {
         return 0;
 
     Score score = ((Score) (p_threats - o_threats)) / (p_threats + o_threats + 1); // add one to ensure |score| < 1
-    assert(score > -INF && score < INF);
+    assert(score > -SCORE_MAX && score < SCORE_MAX);
     return score;
 }
 
@@ -522,18 +626,37 @@ State* newGame() {
     state->p2_owned_bitfield = 0;
     state->p1_threats = 0;
     state->p2_threats = 0;
-    state->p1_forces_on_opponent = 0;
-    state->p2_forces_on_opponent = 0;
     state->playable_ys = 0;
     state->forced_next_move = -1;
     return state;
 }
 
-i8 searchOrder[] = { 3, 2, 4, 1, 5, 0, 6 };
+const i8 searchOrder[] = { 3, 2, 4, 1, 5, 0, 6 };
+
+// We don't bother to cache at leafs, it's only worth it to avoid searching whole branches
+#define CACHE_AND_RETURN(s, f) if (depth >= MIN_DEPTH_TO_CACHE) setCacheValue(p1_bits, p2_bits, s, f); return s;
 
 Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     if (depth <= 0) {
         return heuristicScore(node, player);
+    }
+
+    i64 p1_bits = node->p1_owned_bitfield;
+    i64 p2_bits = node->p2_owned_bitfield;
+
+    // Check cache first
+    if (depth >= MIN_DEPTH_TO_CACHE) {
+        CacheVal* val = checkCache(p1_bits, p2_bits);
+
+        if (val->flags & EXACT) {
+            return val->score;
+        }
+        else if ((val->flags & AT_MOST) && (val->score <= alpha)) {
+            return alpha;
+        }
+        else if ((val->flags & AT_LEAST) && (val->score >= beta)) {
+            return beta;
+        }
     }
 
     i32 playable_ys = node->playable_ys;
@@ -543,15 +666,19 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
         i8 x = node->forced_next_move;
         i8 y = getPlayableY(playable_ys, x);
 
-        Outcome outcome = setToStateAfterMove(node, node, player, x, y);
+        State* child = children[depth-1][x];
+        Outcome outcome = setToStateAfterMove(node, child, player, x, y);
 
-        if (outcome == OUTCOME_WIN)
-            return INF;
-        else if (outcome == OUTCOME_LOSS)
-            return -INF;
-        else
-             // TODO experiment empirically with failing to decrement depth; should we search past our 'fixed' depth to follow a chain of forces?
-            return -minimax(node, depth-1, -beta, -alpha, -player);
+        if (outcome == OUTCOME_WIN) {
+            CACHE_AND_RETURN(SCORE_MAX, EXACT);
+        }
+        else if (outcome == OUTCOME_LOSS) {
+            CACHE_AND_RETURN(-SCORE_MAX, EXACT);
+        }
+        else {
+            // Don't cache because we don't know whether the value is exact or an upper or lower bound, and anyway we wouldn't be saving much because the tree doesn't branch here
+            return -minimax(child, depth-1, -beta, -alpha, -player);
+        }
     }
 
     i8 valid_cols = 0;
@@ -566,12 +693,16 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
 
             Outcome outcome = setToStateAfterMove(node, child, player, x, y);
 
-            if (outcome == OUTCOME_WIN)
-                return INF;
-            else if (outcome != OUTCOME_LOSS)
+            if (outcome == OUTCOME_WIN) {
+                CACHE_AND_RETURN(SCORE_MAX, EXACT);
+            }
+            else if (outcome != OUTCOME_LOSS) {
                 valid_cols |= (1 << x);
+            }
         }
     }
+
+    CacheFlags flag = AT_MOST;
 
     // Absent forced move or instant win, search recursively
     for (i8 i=0; i<NUM_COLS; i++) {
@@ -581,15 +712,19 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
             State* child = children[depth-1][x];
 
             Score res = -minimax(child, depth-1, -beta, -alpha, -player);
-            if (res >= alpha)
+            if (res > alpha) {
+                flag = EXACT;
                 alpha = res;
+            }
 
-            if (alpha >= beta)
+            if (alpha >= beta) {
+                flag = AT_LEAST;
                 break;
+            }
         }
     }
 
-    return alpha;
+    CACHE_AND_RETURN(alpha, flag);
 }
 
 void initStorage(int depth) {
@@ -612,6 +747,17 @@ void freeStorage(int depth) {
     free(children);
 }
 
+void initializeCache() {
+    cacheSize = 0;
+    mostRecentlyUsed = NULL;
+
+    cache = malloc(CACHE_CAPACITY*sizeof(CacheVal*));
+    for (CacheIdx i=0; i<CACHE_CAPACITY; i++) {
+        cache[i] = malloc(sizeof(CacheVal));
+        setCacheValBlank(cache[i]);
+    }
+}
+
 Score score(int numMoves, i8* moves, int depth) {
     State* state = newGame();
     Player player = P1;
@@ -622,7 +768,7 @@ Score score(int numMoves, i8* moves, int depth) {
         i8 y = getPlayableY(state->playable_ys, x);
 
         if (y >= NUM_ROWS) // invalid move
-            return -2*INF; // ensure lower score than a loss
+            return SCORE_INVALID;
 
         outcome = setToStateAfterMove(state, state, player, x, y);
 
@@ -630,16 +776,18 @@ Score score(int numMoves, i8* moves, int depth) {
     }
 
     if (outcome == OUTCOME_WIN)
-        return INF;
+        return SCORE_MAX;
     if (outcome == OUTCOME_LOSS)
-        return -INF;
+        return -SCORE_MAX;
 
+    initializeCache();
     initStorage(depth);
 
-    Score score = minimax(state, depth, -INF, INF, player);
+    Score score = minimax(state, depth, -1, 1, player);
 
-    freeStorage(depth);
-    free(state);
+//    free(cache); // TODO With current structure, leaks individual values
+//    freeStorage(depth);
+//    free(state);
 
     return -score;
 }
