@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <assert.h>
+#include <sys/time.h>
 
 #define i64 unsigned long long
 #define i32 unsigned long
@@ -14,6 +15,8 @@
 
 #define NUM_ROWS 6
 #define NUM_COLS 7
+
+#define Depth short
 
 #define Score float
 #define SCORE_MAX 1
@@ -43,13 +46,17 @@ typedef enum outcome {
     OUTCOME_UNKNOWN = 9
 } Outcome;
 
+bool isForce(Outcome outcome) {
+    return outcome < OUTCOME_WIN;
+}
+
 typedef struct state {
     i64 p1_owned_bitfield;
     i64 p2_owned_bitfield;
     i8 p1_threats;
     i8 p2_threats;
     i32 playable_ys;
-    i8 forced_next_move;
+    Outcome outcome;
 } State;
 
 i64 bit(i8 x, i8 y) {
@@ -83,6 +90,12 @@ i8 bitsSet(i64 v) {
     return (i8) v;
 }
 
+long currentTimeMillis() {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (now.tv_sec*1000) + (now.tv_usec/1000);
+}
+
 void printBoard(State* state) {
     for (int i=5; i>=0; i--) {
         for (int j=0; j<7; j++) {
@@ -111,14 +124,16 @@ void printDebuggingInfo(Player player, i8 x, i8 y, State* parent, State* child, 
 
     fprintf(stderr,"playable Ys: %d %d %d %d %d %d %d\t", tops[0], tops[1], tops[2], tops[3], tops[4], tops[5], tops[6]);
     fprintf(stderr,"player: %d\tx: %d\ty: %d\tp1 moves: %d\tp2 moves: %d\n", player, x, y, bitsSet(child->p1_owned_bitfield), p2_moves);
-    fprintf(stderr,"p1 threats=%d; p2 threats=%d; forced_next_move=%d; score=%f\n", child->p1_threats, child->p2_threats, child->forced_next_move, res);
+    fprintf(stderr,"p1 threats=%d; p2 threats=%d; outcome=%d; score=%f\n", child->p1_threats, child->p2_threats, child->outcome, res);
     fprintf(stderr,"\n\n");
 }
 
+#define MIN_DEPTH_FOR_TIME_CUTOFF 4
+
 #define CacheIdx unsigned int
-#define CACHE_CAPACITY 524288 // 2^19 - needs to be power of two
-#define MAX_CACHE_LOAD 367001 // ~0.7*CACHE_CAPACITY
-#define TARGET_CACHE_LOAD 262144 // ~0.5*CACHE_CAPACITY
+#define CACHE_CAPACITY 262144 // 2^19 - needs to be power of two
+#define MAX_CACHE_LOAD 183500 // ~0.7*CACHE_CAPACITY
+#define TARGET_CACHE_LOAD 131072 // ~0.5*CACHE_CAPACITY
 #define MIN_DEPTH_TO_CACHE 3
 
 typedef enum cacheflags {
@@ -134,8 +149,12 @@ typedef struct cacheval {
     struct cacheval* nextUsed;
     struct cacheval* prevUsed;
     CacheFlags flags;
+    Depth depth;
+    Depth start_depth;
+    i8 best_move;
 } CacheVal;
 
+Depth startDepth;
 CacheIdx cacheSize;
 CacheVal** cache;
 CacheVal* mostRecentlyUsed;
@@ -168,49 +187,79 @@ void setCacheValBlank(CacheVal* val) {
     val->score = SCORE_INVALID;
     val->prevUsed = NULL;
     val->nextUsed = NULL;
-    val->p1_bits = 0;
-    val->p2_bits = 0;
+    val->p1_bits = -1;
+    val->p2_bits = -1;
     val->flags = 0;
+    val->depth = 0;
+    val->start_depth = startDepth;
+    val->best_move = -1;
 }
 
-void recordCacheValUse(CacheVal* val) {
+void removeValFromUsedList(CacheVal* val) {
     CacheVal* oldPrev = val->prevUsed;
     CacheVal* oldNext = val->nextUsed;
 
-    // Add val to front of list
-    val->nextUsed = NULL;
-    val->prevUsed = mostRecentlyUsed;
-    if (mostRecentlyUsed != NULL)
-        mostRecentlyUsed->nextUsed = val;
-    mostRecentlyUsed = val;
+    assert(oldPrev == NULL || oldPrev != oldNext);
 
-    // Patch list where val used to be, if necessary
     if (oldNext != NULL)
         oldNext->prevUsed = oldPrev;
     if (oldPrev != NULL)
         oldPrev->nextUsed = oldNext;
 }
 
-void cleanCache() {
-    assert(cacheSize >= MAX_CACHE_LOAD);
+void addValToFrontOfUsedList(CacheVal* val) {
+    assert(val != mostRecentlyUsed);
 
+    val->nextUsed = NULL;
+    val->prevUsed = mostRecentlyUsed;
+    if (mostRecentlyUsed != NULL)
+        mostRecentlyUsed->nextUsed = val;
+    mostRecentlyUsed = val;
+}
+
+void recordCacheValUse(CacheVal* val) {
+    if (val == mostRecentlyUsed)
+        return;
+
+    removeValFromUsedList(val);
+    addValToFrontOfUsedList(val);
+}
+
+CacheVal* getLeastRecentlyUsed() {
     CacheVal* val = mostRecentlyUsed;
-    for (CacheIdx i=0; i<TARGET_CACHE_LOAD; i++) {
-        assert(val != NULL);
+    while (val->prevUsed != NULL) {
+        assert(val != val->prevUsed);
         val = val->prevUsed;
     }
+    return val;
+}
 
-    assert(val->nextUsed != NULL);
-    (val->nextUsed)->prevUsed = NULL;
+void cleanCacheBelowDepth(Depth depth) {
+    assert(cacheSize >= TARGET_CACHE_LOAD);
 
+    CacheVal* val = getLeastRecentlyUsed();
+
+    while (cacheSize > TARGET_CACHE_LOAD && val != NULL) {
+        CacheVal* next = val->nextUsed;
+        if (val->depth <= depth) {
+            removeValFromUsedList(val);
+            setCacheValBlank(val);
+            cacheSize--;
+        }
+        val = next;
+    }
+}
+
+void cleanCache() {
+    fprintf(stderr, "Cleaning cache...\n");
+
+    assert(cacheSize >= MAX_CACHE_LOAD);
+
+    Depth depth = MIN_DEPTH_TO_CACHE;
     do {
-        assert(val != NULL);
-        CacheVal* tmp = val->prevUsed;
-        setCacheValBlank(val);
-        val = tmp;
-    } while (val != NULL);
-
-    cacheSize = TARGET_CACHE_LOAD;
+        cleanCacheBelowDepth(depth);
+        depth++;
+    } while (cacheSize > TARGET_CACHE_LOAD);
 }
 
 CacheVal* getCacheValue(i64 p1_bits, i64 p2_bits) {
@@ -223,7 +272,7 @@ CacheVal* getCacheValue(i64 p1_bits, i64 p2_bits) {
     return val;
 }
 
-void setCacheValue(i64 p1_bits, i64 p2_bits, Score score, CacheFlags flags) {
+void setCacheValue(i64 p1_bits, i64 p2_bits, Score score, CacheFlags flags, Depth depth, i8 best_move) {
     CacheVal* val = getCacheValue(p1_bits, p2_bits);
 
     assert(isCacheValSet(val) == cacheValMatches(val, p1_bits, p2_bits));
@@ -232,6 +281,9 @@ void setCacheValue(i64 p1_bits, i64 p2_bits, Score score, CacheFlags flags) {
     val->p2_bits = p2_bits;
     val->score = score;
     val->flags = flags;
+    val->depth = depth;
+    val->start_depth = startDepth;
+    val->best_move = best_move;
 
     recordCacheValUse(val);
 
@@ -241,8 +293,6 @@ void setCacheValue(i64 p1_bits, i64 p2_bits, Score score, CacheFlags flags) {
 
     if (cacheSize > MAX_CACHE_LOAD)
         cleanCache();
-
-    assert(val->score == getCacheValue(p1_bits, p2_bits)->score);
 }
 
 CacheVal* checkCache(i64 p1_bits, i64 p2_bits) {
@@ -518,7 +568,11 @@ Outcome outcomeAbsentConnect4ThisTurnOrNext(i8 force_cols_bitfield) {
     }
 }
 
-Outcome countConnect3sOr4sAfterMove(State* state, Player player, i8 x, i8 y, bool forced_move_this_turn) {
+Outcome countConnect3sOr4sAfterMove(State* state, Player player, i8 x, i8 y, Outcome parent_outcome) {
+    // Since the game isn't over, if they have a win, that must mean they previously trapped us
+    if (parent_outcome == OUTCOME_WIN)
+        return OUTCOME_LOSS;
+
     i64 player_owned_bitfield;
     i64 opponent_owned_bitfield;
     i8* player_threats;
@@ -547,7 +601,7 @@ Outcome countConnect3sOr4sAfterMove(State* state, Player player, i8 x, i8 y, boo
         player_threats,
         opponent_threats,
         &forced_moves_next_turn_bitfield,
-        forced_move_this_turn
+        isForce(parent_outcome)
     );
 
     if (outcome == OUTCOME_WIN || outcome == OUTCOME_LOSS)
@@ -589,13 +643,8 @@ Outcome setToStateAfterMove(State* parent, State* child, Player player, i8 x, i8
 
     child->playable_ys = incrementPlayableY(parent->playable_ys, x);
 
-    Outcome outcome = countConnect3sOr4sAfterMove(child, player, x, y, parent->forced_next_move > -1);
-
-    if (outcome < OUTCOME_WIN) // force move
-        child->forced_next_move = outcome;
-    else
-        child->forced_next_move = -1;
-
+    Outcome outcome = countConnect3sOr4sAfterMove(child, player, x, y, parent->outcome);
+    child->outcome = outcome;
     return outcome;
 }
 
@@ -627,16 +676,62 @@ State* newGame() {
     state->p1_threats = 0;
     state->p2_threats = 0;
     state->playable_ys = 0;
-    state->forced_next_move = -1;
+    state->outcome = OUTCOME_UNKNOWN;
     return state;
 }
 
-const i8 searchOrder[] = { 3, 2, 4, 1, 5, 0, 6 };
-
 // We don't bother to cache at leafs, it's only worth it to avoid searching whole branches
-#define CACHE_AND_RETURN(s, f) if (depth >= MIN_DEPTH_TO_CACHE) setCacheValue(p1_bits, p2_bits, s, f); return s;
+bool cacheAtDepth(Depth depth) {
+    return depth >= MIN_DEPTH_TO_CACHE || startDepth < MIN_DEPTH_TO_CACHE;
+}
 
-Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
+i8 getInitialBestMove(i8 valid_non_loss_cols, i32 playable_ys, State* state, i8 depth, i8* searchOrder) {
+    // If we cached at this depth on the last, less deep search
+    if (cacheAtDepth(depth-1)) {
+        CacheVal* val = getCacheValue(state->p1_owned_bitfield, state->p2_owned_bitfield);
+        if (isCacheValSet(val)) {
+            i8 cached = val->best_move;
+
+            // Insert at beginning of search order
+            if (cached != searchOrder[0]) {
+                i8 i=0;
+                while (searchOrder[i] != cached) {
+                    i++;
+                    assert(i < NUM_COLS);
+                }
+
+                while (i>0) {
+                    searchOrder[i] = searchOrder[i-1];
+                    i--;
+                }
+
+                searchOrder[0] = cached;
+            }
+
+            return cached;
+        }
+    }
+
+    if (valid_non_loss_cols > 0) {
+        for (i8 i=0; i<NUM_COLS; i++) {
+            i8 x = searchOrder[x];
+            if (valid_non_loss_cols & (1 << x))
+                return x;
+        }
+    }
+
+    for (i8 i=0; i<NUM_COLS; i++) {
+        i8 x = searchOrder[i];
+        if (NUM_ROWS > getPlayableY(playable_ys, x))
+            return x;
+    }
+
+    return -1;
+}
+
+#define CACHE_AND_RETURN(s, f, m) if (cacheAtDepth(depth)) setCacheValue(p1_bits, p2_bits, s, f, depth, m); return s;
+
+Score minimax(State* node, Depth depth, Score alpha, Score beta, Player player) {
     if (depth <= 0) {
         return heuristicScore(node, player);
     }
@@ -645,43 +740,47 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     i64 p2_bits = node->p2_owned_bitfield;
 
     // Check cache first
-    if (depth >= MIN_DEPTH_TO_CACHE) {
+    if (cacheAtDepth(depth)) {
         CacheVal* val = checkCache(p1_bits, p2_bits);
 
-        if (val->flags & EXACT) {
-            return val->score;
-        }
-        else if ((val->flags & AT_MOST) && (val->score <= alpha)) {
-            return alpha;
-        }
-        else if ((val->flags & AT_LEAST) && (val->score >= beta)) {
-            return beta;
+        if (val->start_depth == startDepth) {
+            if (val->flags & EXACT) {
+                return val->score;
+            }
+            else if ((val->flags & AT_MOST) && (val->score <= alpha)) {
+                return alpha;
+            }
+            else if ((val->flags & AT_LEAST) && (val->score >= beta)) {
+                return beta;
+            }
         }
     }
 
     i32 playable_ys = node->playable_ys;
 
     // If we know our next move is forced, just search that
-    if (node->forced_next_move >= 0) {
-        i8 x = node->forced_next_move;
+    if (isForce(node->outcome)) {
+        i8 x = node->outcome;
         i8 y = getPlayableY(playable_ys, x);
 
         State* child = children[depth-1][x];
         Outcome outcome = setToStateAfterMove(node, child, player, x, y);
 
         if (outcome == OUTCOME_WIN) {
-            CACHE_AND_RETURN(SCORE_MAX, EXACT);
+            CACHE_AND_RETURN(SCORE_MAX, EXACT, x);
         }
         else if (outcome == OUTCOME_LOSS) {
-            CACHE_AND_RETURN(-SCORE_MAX, EXACT);
+            CACHE_AND_RETURN(-SCORE_MAX, EXACT, x);
         }
         else {
             // Don't cache because we don't know whether the value is exact or an upper or lower bound, and anyway we wouldn't be saving much because the tree doesn't branch here
+            // We can do this because we only rely on the cache to save the best move for output when there is no force move
             return -minimax(child, depth-1, -beta, -alpha, -player);
         }
     }
 
     i8 valid_cols = 0;
+    i8 searchOrder[] = { 3, 2, 4, 1, 5, 0, 6 };
 
     // Absent a force move, search for instant wins
     for (i8 i=0; i<NUM_COLS; i++) {
@@ -694,7 +793,7 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
             Outcome outcome = setToStateAfterMove(node, child, player, x, y);
 
             if (outcome == OUTCOME_WIN) {
-                CACHE_AND_RETURN(SCORE_MAX, EXACT);
+                CACHE_AND_RETURN(SCORE_MAX, EXACT, x);
             }
             else if (outcome != OUTCOME_LOSS) {
                 valid_cols |= (1 << x);
@@ -703,6 +802,7 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
     }
 
     CacheFlags flag = AT_MOST;
+    i8 best = getInitialBestMove(valid_cols, playable_ys, node, depth, searchOrder);
 
     // Absent forced move or instant win, search recursively
     for (i8 i=0; i<NUM_COLS; i++) {
@@ -715,6 +815,7 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
             if (res > alpha) {
                 flag = EXACT;
                 alpha = res;
+                best = x;
             }
 
             if (alpha >= beta) {
@@ -724,22 +825,22 @@ Score minimax(State* node, int depth, Score alpha, Score beta, Player player) {
         }
     }
 
-    CACHE_AND_RETURN(alpha, flag);
+    CACHE_AND_RETURN(alpha, flag, best);
 }
 
-void initStorage(int depth) {
+void initStorage(Depth depth) {
     children = malloc(depth*sizeof(State**));
-    for (int i=0; i<depth; i++) {
+    for (Depth i=0; i<depth; i++) {
         children[i] = malloc(NUM_COLS*sizeof(State*));
-        for (int j=0; j<NUM_COLS; j++) {
+        for (i8 j=0; j<NUM_COLS; j++) {
             children[i][j] = malloc(sizeof(State));
         }
     }
 }
 
-void freeStorage(int depth) {
-    for (int i=0; i<depth; i++) {
-        for (int j=0; j<NUM_COLS; j++) {
+void freeStorage(Depth depth) {
+    for (Depth i=0; i<depth; i++) {
+        for (i8 j=0; j<NUM_COLS; j++) {
             free(children[i][j]);
         }
         free(children[i]);
@@ -758,7 +859,20 @@ void initializeCache() {
     }
 }
 
-Score score(int numMoves, i8* moves, int depth) {
+Score searchToDepth(State* state, Player player, Depth depth) {
+    initStorage(depth);
+    startDepth = depth;
+
+    Score score = minimax(state, depth, -1, 1, player);
+
+    freeStorage(depth);
+
+    return score;
+}
+
+i8 findNextMove(int numMoves, i8* moves, long maxMillis) {
+    long cutoffMillis = currentTimeMillis()+(maxMillis/2);
+
     State* state = newGame();
     Player player = P1;
     Outcome outcome = OUTCOME_UNKNOWN;
@@ -767,36 +881,39 @@ Score score(int numMoves, i8* moves, int depth) {
         i8 x = moves[i];
         i8 y = getPlayableY(state->playable_ys, x);
 
-        if (y >= NUM_ROWS) // invalid move
-            return SCORE_INVALID;
+        assert(y < NUM_ROWS);
 
         outcome = setToStateAfterMove(state, state, player, x, y);
-
         player = -player;
     }
 
-    if (outcome == OUTCOME_WIN)
-        return SCORE_MAX;
-    if (outcome == OUTCOME_LOSS)
-        return -SCORE_MAX;
+    if (isForce(outcome))
+        return outcome;
 
     initializeCache();
-    initStorage(depth);
 
-    Score score = minimax(state, depth, -1, 1, player);
+    Score score;
+    i8 best;
+    Depth depth = 1;
 
-//    free(cache); // TODO With current structure, leaks individual values
-//    freeStorage(depth);
-//    free(state);
+    do {
+        score = searchToDepth(state, player, depth);
+        CacheVal* val = getCacheValue(state->p1_owned_bitfield, state->p2_owned_bitfield);
+        assert(isCacheValSet(val));
+        best = val->best_move;
+        depth++;
+    } while (currentTimeMillis() < cutoffMillis && score < SCORE_MAX && score > -SCORE_MAX);
 
-    return -score;
+    fprintf(stderr, "At depth %d scored %d:%f for move %d\n", depth, player, score, best);
+
+    return best;
 }
 
 int main(int argc, char* argv[]) {
     assert(argc >= 2);
 
-    int depth = atoi(argv[1]);
-    assert(depth >= 0);
+    int maxMillis = atoi(argv[1]);
+    assert(maxMillis > 0);
 
     int numMoves = argc-2;
     i8* moves = malloc(sizeof(i8) * numMoves);
@@ -805,5 +922,5 @@ int main(int argc, char* argv[]) {
         assert(moves[i] >= 0 && moves[i] < NUM_COLS);
     }
 
-    printf("%f\n", score(numMoves, moves, depth));
+    printf("%d\n", findNextMove(numMoves, moves, maxMillis));
 }
